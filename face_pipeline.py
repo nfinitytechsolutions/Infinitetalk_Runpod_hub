@@ -255,7 +255,7 @@ class FaceRestorer:
         logger.info(f"[FacePipeline] CodeFormer loaded (fidelity={fidelity_weight}, device={self.device})")
 
     def _load_model(self, model_path):
-        from basicsr.archs.codeformer_arch import CodeFormer
+        from codeformer_arch import CodeFormer
         self.model = CodeFormer(
             dim_embd=512, codebook_size=1024, n_head=8, n_layers=9,
             connect_list=["32", "64", "128", "256"],

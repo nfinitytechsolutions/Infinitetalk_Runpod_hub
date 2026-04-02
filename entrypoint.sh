@@ -3,6 +3,15 @@
 # Exit immediately if a command exits with a non-zero status.
 set -e
 
+# Pre-download InsightFace buffalo_l model if not cached (first run only)
+echo "Checking InsightFace model cache..."
+python -c "
+from insightface.app import FaceAnalysis
+app = FaceAnalysis(name='buffalo_l', providers=['CPUExecutionProvider'])
+app.prepare(ctx_id=0, det_size=(640,640))
+print('InsightFace buffalo_l model ready')
+" 2>/dev/null || echo "InsightFace pre-download skipped (non-critical)"
+
 # Start ComfyUI in the background
 echo "Starting ComfyUI in the background..."
 python /ComfyUI/main.py --listen --use-sage-attention &

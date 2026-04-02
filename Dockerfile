@@ -8,7 +8,8 @@ RUN pip install -U "huggingface_hub[hf_transfer]"
 RUN pip install runpod websocket-client librosa
 
 # Face-fix pipeline dependencies (Crop-Restore-Stitch for melting teeth fix)
-RUN pip install insightface onnxruntime-gpu opencv-python-headless basicsr
+# Note: basicsr is NOT needed — CodeFormer arch is vendored in codeformer_arch.py
+RUN pip install insightface onnxruntime-gpu opencv-python-headless
 
 WORKDIR /
 
@@ -67,9 +68,6 @@ RUN wget -q https://huggingface.co/Kijai/MelBandRoFormer_comfy/resolve/main/MelB
 # CodeFormer face restoration model (~370MB)
 RUN mkdir -p /models/codeformer && \
     wget -q https://github.com/sczhou/CodeFormer/releases/download/v0.1.0/codeformer.pth -O /models/codeformer/codeformer.pth
-
-# Pre-download InsightFace buffalo_l model (avoids runtime download)
-RUN python -c "from insightface.app import FaceAnalysis; app = FaceAnalysis(name='buffalo_l', providers=['CPUExecutionProvider']); app.prepare(ctx_id=0, det_size=(640,640))" || true
 
 COPY . .
 RUN chmod +x /entrypoint.sh
