@@ -545,6 +545,40 @@ def handler(job):
         logger.error(f"출력 비디오 파일이 존재하지 않습니다: {output_video_path}")
         return {"error": f"비디오 파일을 찾을 수 없습니다: {output_video_path}"}
 
+    # ------------------------------------------------------------------
+    # Face-fix postprocessing (Crop-Restore-Stitch pipeline)
+    # ------------------------------------------------------------------
+    face_fix = job_input.get("face_fix", False)
+    if face_fix:
+        logger.info("🦷 Face-fix postprocessing pipeline 시작...")
+        try:
+            from face_pipeline import run_face_pipeline
+
+            face_fix_params = job_input.get("face_fix_params", {})
+            fixed_path = f"/tmp/facefix_{task_id}.mp4"
+
+            run_face_pipeline(
+                input_video=output_video_path,
+                output_video=fixed_path,
+                fidelity_weight=face_fix_params.get("fidelity_weight", 0.6),
+                face_margin=face_fix_params.get("face_margin", 0.2),
+                crop_size=face_fix_params.get("crop_size", 512),
+                temporal_window=face_fix_params.get("temporal_window", 5),
+                feather_radius=face_fix_params.get("feather_radius", 15),
+                detect_interval=face_fix_params.get("detect_interval", 5),
+                restore_batch_size=face_fix_params.get("restore_batch_size", 8),
+                codeformer_model_path=face_fix_params.get(
+                    "codeformer_model_path", "/models/codeformer/codeformer.pth"
+                ),
+            )
+            output_video_path = fixed_path
+            logger.info("✅ Face-fix postprocessing 완료")
+        except Exception as e:
+            logger.error(f"⚠️ Face-fix postprocessing 실패 (원본 사용): {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+    # ------------------------------------------------------------------
+
     # network_volume 파라미터 확인
     use_network_volume = job_input.get("network_volume", False)
     logger.info(f"네트워크 볼륨 사용 여부: {use_network_volume}")
