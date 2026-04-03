@@ -490,8 +490,20 @@ class FrameUpscaler:
             from realesrgan.archs.srvgg_arch import SRVGGNetCompact
             model = SRVGGNetCompact(num_in_ch=3, num_out_ch=3, num_feat=64, num_conv=32, upscale=4, act_type="prelu")
         else:
-            from basicsr.archs.rrdbnet_arch import RRDBNet
+            from rrdbnet_arch import RRDBNet
             model = RRDBNet(num_in_ch=3, num_out_ch=3, num_feat=64, num_block=23, num_grow_ch=32, scale=model_info["scale"])
+
+        # Patch basicsr's broken import of torchvision.transforms.functional_tensor
+        # (removed in newer torchvision, but basicsr.data.degradations still imports it)
+        import sys
+        try:
+            import torchvision.transforms.functional_tensor
+        except ModuleNotFoundError:
+            import types
+            import torchvision.transforms.functional as _F
+            _fake = types.ModuleType("torchvision.transforms.functional_tensor")
+            _fake.rgb_to_grayscale = _F.rgb_to_grayscale
+            sys.modules["torchvision.transforms.functional_tensor"] = _fake
 
         from realesrgan import RealESRGANer
         self.upscaler = RealESRGANer(
