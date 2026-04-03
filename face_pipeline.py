@@ -662,3 +662,199 @@ def run_face_pipeline(
     encode_video(fixed_frames_dir, audio_path, output_video, fps)
     logger.info(f"[FacePipeline] Pipeline complete: {output_video}")
     return output_video
+
+
+# ---------------------------------------------------------------------------
+# Two-pass face enhancement: auto-crop input + composite
+# ---------------------------------------------------------------------------
+
+def auto_crop_input(image_path: str, target_coverage: float = 0.35,
+                    margin: float = 0.15, min_size: int = 512) -> str | None:
+    """Crop the input image to a face close-up for a second InfiniteTalk pass.
+
+    Detects the primary face, calculates how much of the frame it occupies,
+    and if the coverage is below *target_coverage* produces a tighter 1:1
+    crop centred on the face.
+
+    Returns:
+        Path to the cropped image, or None if the face already fills the
+        frame sufficiently (no second pass needed).
+    """
+    from insightface.app import FaceAnalysis
+
+    img = cv2.imread(image_path)
+    if img is None:
+        logger.warning(f"[AutoCrop] Could not read image: {image_path}")
+        return None
+
+    h, w = img.shape[:2]
+
+    fa = FaceAnalysis(
+        name="buffalo_l",
+        providers=["CUDAExecutionProvider", "CPUExecutionProvider"],
+    )
+    fa.prepare(ctx_id=0, det_size=(640, 640))
+    faces = fa.get(img)
+
+    if not faces:
+        logger.info("[AutoCrop] No face detected -- skipping two-pass")
+        return None
+
+    face = max(faces, key=lambda f: f.det_score)
+    x1, y1, x2, y2 = face.bbox.astype(int)
+    face_w, face_h = x2 - x1, y2 - y1
+    coverage = (face_w * face_h) / (w * h)
+
+    logger.info(
+        f"[AutoCrop] Face bbox=({x1},{y1})-({x2},{y2})  "
+        f"coverage={coverage:.1%}  target={target_coverage:.1%}"
+    )
+
+    if coverage >= target_coverage:
+        logger.info("[AutoCrop] Face already fills frame -- two-pass not needed")
+        return None
+
+    # Build a 1:1 square crop centred on the face
+    face_cx, face_cy = (x1 + x2) // 2, (y1 + y2) // 2
+    face_size = max(face_w, face_h)
+    half_side = int(face_size * (1 + margin) / 2)
+
+    # Ensure minimum crop size
+    half_side = max(half_side, min_size // 2)
+
+    crop_x1 = max(0, face_cx - half_side)
+    crop_y1 = max(0, face_cy - half_side)
+    crop_x2 = min(w, face_cx + half_side)
+    crop_y2 = min(h, face_cy + half_side)
+
+    # Make it square by clamping to the smaller side
+    crop_w = crop_x2 - crop_x1
+    crop_h = crop_y2 - crop_y1
+    side = min(crop_w, crop_h)
+    # Re-centre
+    crop_x1 = max(0, face_cx - side // 2)
+    crop_y1 = max(0, face_cy - side // 2)
+    crop_x2 = crop_x1 + side
+    crop_y2 = crop_y1 + side
+    if crop_x2 > w:
+        crop_x1, crop_x2 = w - side, w
+    if crop_y2 > h:
+        crop_y1, crop_y2 = h - side, h
+
+    cropped = img[crop_y1:crop_y2, crop_x1:crop_x2]
+
+    new_coverage = (face_w * face_h) / (side * side)
+    logger.info(
+        f"[AutoCrop] Cropping ({w}x{h}) -> ({side}x{side})  "
+        f"new face coverage={new_coverage:.1%}"
+    )
+
+    cropped_path = image_path.rsplit(".", 1)[0] + "_facecrop.jpg"
+    cv2.imwrite(cropped_path, cropped, [cv2.IMWRITE_JPEG_QUALITY, 97])
+    logger.info(f"[AutoCrop] Saved cropped image: {cropped_path}")
+    return cropped_path
+
+
+def composite_two_pass(
+    full_video_path: str,
+    face_video_path: str,
+    output_path: str,
+    face_margin: float = 0.2,
+    feather_radius: int = 20,
+    temporal_window: int = 5,
+    detect_interval: int = 5,
+) -> str:
+    """Composite high-quality face from Pass 2 onto full-frame Pass 1 video.
+
+    Pass 1 = full-frame video (good body/background, lower-quality face).
+    Pass 2 = close-up face video (high-quality face generated from cropped input).
+
+    For each frame:
+      1. Detect face bounding box in Pass 1 frame.
+      2. Take the corresponding Pass 2 frame (which is mostly face).
+      3. Resize Pass 2 frame to match the face region in Pass 1.
+      4. Feathered-blend Pass 2 face onto Pass 1 frame.
+
+    Returns path to the composited output video.
+    """
+    work_dir = tempfile.mkdtemp(prefix="twopass_")
+    logger.info(f"[TwoPass] Work dir: {work_dir}")
+
+    # Extract frames from both videos
+    logger.info("[TwoPass] Extracting Pass 1 (full-frame) frames...")
+    fps1, frames_dir1, audio_path, count1 = extract_frames(full_video_path, os.path.join(work_dir, "pass1"))
+
+    logger.info("[TwoPass] Extracting Pass 2 (face close-up) frames...")
+    fps2, frames_dir2, _, count2 = extract_frames(face_video_path, os.path.join(work_dir, "pass2"))
+
+    frame_files1 = sorted(f for f in os.listdir(frames_dir1) if f.endswith(".png"))
+    frame_files2 = sorted(f for f in os.listdir(frames_dir2) if f.endswith(".png"))
+
+    frames1 = [cv2.imread(os.path.join(frames_dir1, f)) for f in frame_files1]
+    frames2 = [cv2.imread(os.path.join(frames_dir2, f)) for f in frame_files2]
+
+    # Handle frame count mismatch (use the shorter one)
+    num_frames = min(len(frames1), len(frames2))
+    frames1 = frames1[:num_frames]
+    frames2 = frames2[:num_frames]
+    logger.info(f"[TwoPass] Pass 1: {len(frame_files1)} frames, Pass 2: {len(frame_files2)} frames, using {num_frames}")
+
+    # Detect and track faces in Pass 1 video
+    logger.info("[TwoPass] Detecting faces in Pass 1 video...")
+    detector = FaceDetector()
+    tracks = detector.detect_and_track(frames1, detect_interval=detect_interval)
+
+    if not tracks:
+        logger.warning("[TwoPass] No faces found in Pass 1 -- returning Pass 1 as-is")
+        import shutil
+        shutil.copy2(full_video_path, output_path)
+        return output_path
+
+    # Process each tracked person (typically just one for single-person mode)
+    for person_id, track in tracks.items():
+        logger.info(f"[TwoPass] Compositing person {person_id}...")
+
+        composite_indices = []
+        composite_crops = []
+        composite_params = []
+
+        for i, face in enumerate(track):
+            if face is None or i >= num_frames:
+                continue
+
+            # Get the face crop region from Pass 1
+            _, params = detector.crop_face(frames1[i], face, margin=face_margin, size=512)
+
+            # The Pass 2 frame IS the face -- resize it to fit the crop region
+            crop_w = params["crop_x2"] - params["crop_x1"]
+            crop_h = params["crop_y2"] - params["crop_y1"]
+            resized_face = cv2.resize(frames2[i], (crop_w, crop_h), interpolation=cv2.INTER_LANCZOS4)
+
+            composite_indices.append(i)
+            composite_crops.append(resized_face)
+            composite_params.append(params)
+
+        if not composite_crops:
+            continue
+
+        # Temporal smoothing on the face crops before stitching
+        if temporal_window > 1 and len(composite_crops) > 1:
+            logger.info(f"[TwoPass]   Temporal smoothing (window={temporal_window})...")
+            composite_crops = temporal_smooth(composite_crops, temporal_window)
+
+        # Feathered stitch Pass 2 face onto Pass 1 frames
+        logger.info(f"[TwoPass]   Stitching {len(composite_crops)} frames (feather={feather_radius}px)...")
+        for idx, (frame_i, params) in enumerate(zip(composite_indices, composite_params)):
+            frames1[frame_i] = stitch_face(frames1[frame_i], composite_crops[idx], params, feather_radius)
+
+    # Encode final video
+    logger.info("[TwoPass] Encoding composited output...")
+    out_frames_dir = os.path.join(work_dir, "output_frames")
+    os.makedirs(out_frames_dir, exist_ok=True)
+
+    for i, frame in enumerate(frames1):
+        cv2.imwrite(os.path.join(out_frames_dir, f"frame_{i + 1:06d}.png"), frame)
+
+    encode_video(out_frames_dir, audio_path, output_path, fps1)
+    logger.info(f"[TwoPass] Composite complete: {output_path}")
+    return output_path

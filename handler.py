@@ -276,6 +276,55 @@ def calculate_max_frames_from_audio(wav_path, wav_path_2=None, fps=25):
     return max_frames
 
 
+def _run_comfyui_job(prompt, input_type="image", person_count="single"):
+    """Connect to ComfyUI via WebSocket, queue a prompt, and return the output video path."""
+    import time
+
+    ws_url = f"ws://{server_address}:8188/ws?clientId={client_id}"
+    http_url = f"http://{server_address}:8188/"
+
+    # HTTP health check (max 3 min)
+    max_http_attempts = 180
+    for http_attempt in range(max_http_attempts):
+        try:
+            response = urllib.request.urlopen(http_url, timeout=5)
+            logger.info(f"HTTP 연결 성공 (시도 {http_attempt+1})")
+            break
+        except Exception as e:
+            logger.warning(f"HTTP 연결 실패 (시도 {http_attempt+1}/{max_http_attempts}): {e}")
+            if http_attempt == max_http_attempts - 1:
+                raise Exception("ComfyUI 서버에 연결할 수 없습니다.")
+            time.sleep(1)
+
+    # WebSocket connect (max 3 min)
+    ws = websocket.WebSocket()
+    max_attempts = int(180 / 5)
+    for attempt in range(max_attempts):
+        try:
+            ws.connect(ws_url)
+            logger.info(f"웹소켓 연결 성공 (시도 {attempt+1})")
+            break
+        except Exception as e:
+            logger.warning(f"웹소켓 연결 실패 (시도 {attempt+1}/{max_attempts}): {e}")
+            if attempt == max_attempts - 1:
+                raise Exception("웹소켓 연결 시간 초과 (3분)")
+            time.sleep(5)
+
+    videos = get_videos(ws, prompt, input_type, person_count)
+    ws.close()
+    logger.info("웹소켓 연결 종료")
+
+    # Find output video
+    for node_id in videos:
+        if videos[node_id]:
+            video_path = videos[node_id][0]
+            logger.info(f"노드 {node_id}에서 출력 비디오 발견: {video_path}")
+            if os.path.exists(video_path):
+                return video_path
+
+    return None
+
+
 def handler(job):
     job_input = job.get("input", {})
 
@@ -479,71 +528,81 @@ def handler(job):
             if "313" in prompt:
                 prompt["313"]["inputs"]["audio"] = wav_path_2
 
-    ws_url = f"ws://{server_address}:8188/ws?clientId={client_id}"
-    logger.info(f"Connecting to WebSocket: {ws_url}")
-
-    # 먼저 HTTP 연결이 가능한지 확인
-    http_url = f"http://{server_address}:8188/"
-    logger.info(f"Checking HTTP connection to: {http_url}")
-
-    # HTTP 연결 확인 (최대 1분)
-    max_http_attempts = 180
-    for http_attempt in range(max_http_attempts):
-        try:
-            import urllib.request
-
-            response = urllib.request.urlopen(http_url, timeout=5)
-            logger.info(f"HTTP 연결 성공 (시도 {http_attempt+1})")
-            break
-        except Exception as e:
-            logger.warning(
-                f"HTTP 연결 실패 (시도 {http_attempt+1}/{max_http_attempts}): {e}"
-            )
-            if http_attempt == max_http_attempts - 1:
-                raise Exception(
-                    "ComfyUI 서버에 연결할 수 없습니다. 서버가 실행 중인지 확인하세요."
-                )
-            time.sleep(1)
-
-    ws = websocket.WebSocket()
-    # 웹소켓 연결 시도 (최대 3분)
-    max_attempts = int(180 / 5)  # 3분 (1초에 한 번씩 시도)
-    for attempt in range(max_attempts):
-        import time
-
-        try:
-            ws.connect(ws_url)
-            logger.info(f"웹소켓 연결 성공 (시도 {attempt+1})")
-            break
-        except Exception as e:
-            logger.warning(f"웹소켓 연결 실패 (시도 {attempt+1}/{max_attempts}): {e}")
-            if attempt == max_attempts - 1:
-                raise Exception("웹소켓 연결 시간 초과 (3분)")
-            time.sleep(5)
-    videos = get_videos(ws, prompt, input_type, person_count)
-    ws.close()
-    logger.info("웹소켓 연결 종료")
-
-    # 비디오가 없는 경우 처리
-    output_video_path = None
-    logger.info("출력 비디오 검색 중...")
-
-    for node_id in videos:
-        if videos[node_id]:
-            output_video_path = videos[node_id][0]
-            logger.info(f"노드 {node_id}에서 출력 비디오 발견: {output_video_path}")
-            break
-        else:
-            logger.info(f"노드 {node_id}는 비어있음")
+    # ------------------------------------------------------------------
+    # Pass 1: Run InfiniteTalk (full-frame)
+    # ------------------------------------------------------------------
+    logger.info("🎬 Pass 1: Running InfiniteTalk (full-frame)...")
+    output_video_path = _run_comfyui_job(prompt, input_type, person_count)
 
     if not output_video_path:
         logger.error("출력 비디오를 찾을 수 없습니다. 모든 노드가 비어있습니다.")
         return {"error": "비디오를 찾을 수 없습니다."}
 
-    # 비디오 파일 존재 여부 확인
-    if not os.path.exists(output_video_path):
-        logger.error(f"출력 비디오 파일이 존재하지 않습니다: {output_video_path}")
-        return {"error": f"비디오 파일을 찾을 수 없습니다: {output_video_path}"}
+    # ------------------------------------------------------------------
+    # Two-pass face enhancement (optional)
+    # ------------------------------------------------------------------
+    two_pass_face = job_input.get("two_pass_face", False)
+    if two_pass_face and input_type == "image":
+        logger.info("🔄 Two-pass face enhancement enabled")
+        try:
+            from face_pipeline import auto_crop_input, composite_two_pass
+
+            two_pass_params = job_input.get("two_pass_params", {})
+            target_coverage = two_pass_params.get("target_coverage", 0.35)
+            crop_margin = two_pass_params.get("crop_margin", 0.15)
+
+            # Auto-crop the input image to a face close-up
+            cropped_image_path = auto_crop_input(
+                media_path,
+                target_coverage=target_coverage,
+                margin=crop_margin,
+            )
+
+            if cropped_image_path is not None:
+                # Build Pass 2 workflow with cropped face image
+                logger.info("🎬 Pass 2: Running InfiniteTalk (face close-up)...")
+                prompt2 = load_workflow(workflow_path)
+
+                # Inject same settings but with cropped image
+                prompt2["284"]["inputs"]["image"] = cropped_image_path
+                prompt2["125"]["inputs"]["audio"] = wav_path
+                prompt2["241"]["inputs"]["positive_prompt"] = prompt_text
+                # Use square dimensions for the close-up pass
+                face_crop_size = two_pass_params.get("face_crop_size", 512)
+                prompt2["245"]["inputs"]["value"] = face_crop_size
+                prompt2["246"]["inputs"]["value"] = face_crop_size
+                prompt2["270"]["inputs"]["value"] = max_frame
+
+                # Inject force_offload if sampler node exists
+                if sampler_node_id and sampler_node_id in prompt2:
+                    prompt2[sampler_node_id].setdefault("inputs", {})["force_offload"] = force_offload
+
+                face_video_path = _run_comfyui_job(prompt2, input_type, person_count)
+
+                if face_video_path:
+                    # Composite Pass 2 face onto Pass 1 full-frame
+                    logger.info("🧩 Compositing Pass 2 face onto Pass 1 full-frame...")
+                    composited_path = f"/tmp/twopass_{task_id}.mp4"
+                    composite_two_pass(
+                        full_video_path=output_video_path,
+                        face_video_path=face_video_path,
+                        output_path=composited_path,
+                        face_margin=two_pass_params.get("face_margin", 0.2),
+                        feather_radius=two_pass_params.get("feather_radius", 20),
+                        temporal_window=two_pass_params.get("temporal_window", 5),
+                        detect_interval=two_pass_params.get("detect_interval", 5),
+                    )
+                    output_video_path = composited_path
+                    logger.info("✅ Two-pass composite 완료")
+                else:
+                    logger.warning("⚠️ Pass 2 produced no video -- using Pass 1 only")
+            else:
+                logger.info("ℹ️ Face already fills frame -- skipping Pass 2")
+
+        except Exception as e:
+            logger.error(f"⚠️ Two-pass enhancement failed (using Pass 1): {e}")
+            import traceback
+            logger.error(traceback.format_exc())
 
     # ------------------------------------------------------------------
     # Face-fix postprocessing (Crop-Restore-Stitch pipeline)
