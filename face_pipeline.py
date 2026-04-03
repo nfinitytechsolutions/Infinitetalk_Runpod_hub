@@ -178,7 +178,11 @@ class FaceDetector:
 
     @staticmethod
     def crop_face(frame, face, margin=0.2, size=512):
-        """Crop face region with margin, resize to size x size.
+        """Crop face region with adaptive margin, resize to size x size.
+
+        For close-up shots where the face already fills most of the frame,
+        the margin is automatically reduced to maximize pixel budget for
+        teeth/mouth detail in the 512x512 crop.
 
         Returns (cropped_image, crop_params_dict).
         """
@@ -186,8 +190,17 @@ class FaceDetector:
         x1, y1, x2, y2 = face["bbox"][:4].astype(int)
         face_w, face_h = x2 - x1, y2 - y1
 
+        # Adaptive margin: reduce for close-ups where face already fills frame
+        face_coverage = (face_w * face_h) / (w * h)
+        if face_coverage > 0.4:
+            effective_margin = margin * 0.3   # close-up: minimal margin
+        elif face_coverage > 0.2:
+            effective_margin = margin * 0.6   # medium shot
+        else:
+            effective_margin = margin          # wide shot: full margin
+
         center_x, center_y = (x1 + x2) // 2, (y1 + y2) // 2
-        half_side = int(max(face_w, face_h) * (1 + margin) / 2)
+        half_side = int(max(face_w, face_h) * (1 + effective_margin) / 2)
 
         crop_x1 = max(0, center_x - half_side)
         crop_y1 = max(0, center_y - half_side)
@@ -308,10 +321,27 @@ class FaceRestorer:
 # ---------------------------------------------------------------------------
 
 def temporal_smooth(crops, window=5):
-    """Apply Gaussian temporal smoothing across sequential face crops to reduce flicker."""
+    """Apply selective temporal smoothing -- preserves lip-sync, smooths teeth flicker.
+
+    Uses a spatial weight mask so the mouth/lip edges get minimal smoothing
+    (to keep lip movement sharp) while the rest of the face (forehead, cheeks,
+    teeth interior) gets full temporal smoothing to reduce flicker artifacts.
+    """
     n = len(crops)
     if n <= 1 or window <= 1:
         return crops
+
+    h, w = crops[0].shape[:2]
+
+    # Spatial weight mask: 1.0 = full smoothing, lower = less smoothing
+    # Lip region gets reduced smoothing to preserve lip-sync movement
+    smooth_mask = np.ones((h, w), dtype=np.float32)
+    lip_top = int(h * 0.55)
+    lip_bottom = int(h * 0.80)
+    lip_left = int(w * 0.25)
+    lip_right = int(w * 0.75)
+    smooth_mask[lip_top:lip_bottom, lip_left:lip_right] = 0.3
+    smooth_mask = cv2.GaussianBlur(smooth_mask, (0, 0), sigmaX=w * 0.05)
 
     half_w = window // 2
     kernel = np.array([
@@ -324,14 +354,20 @@ def temporal_smooth(crops, window=5):
     for i in range(n):
         acc = np.zeros_like(crops[i], dtype=np.float32)
         wsum = 0.0
-        for k, w in enumerate(kernel):
+        for k, kw in enumerate(kernel):
             j = i + k - half_w
             if 0 <= j < n:
-                acc += w * crops[j].astype(np.float32)
-                wsum += w
+                acc += kw * crops[j].astype(np.float32)
+                wsum += kw
         if wsum > 0:
             acc /= wsum
-        smoothed.append(np.clip(acc, 0, 255).astype(np.uint8))
+
+        # Blend: smooth_mask controls per-pixel smoothing strength
+        mask_3ch = smooth_mask[:, :, np.newaxis]
+        original = crops[i].astype(np.float32)
+        blended = mask_3ch * acc + (1.0 - mask_3ch) * original
+
+        smoothed.append(np.clip(blended, 0, 255).astype(np.uint8))
     return smoothed
 
 
