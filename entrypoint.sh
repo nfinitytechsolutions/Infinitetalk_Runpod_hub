@@ -12,6 +12,14 @@ app.prepare(ctx_id=0, det_size=(640,640))
 print('InsightFace buffalo_l model ready')
 " 2>/dev/null || echo "InsightFace pre-download skipped (non-critical)"
 
+# Pre-download Real-ESRGAN model if not present (fallback for build timeout)
+if [ ! -f /models/realesrgan/RealESRGAN_x2plus.pth ]; then
+    echo "Downloading Real-ESRGAN x2plus model..."
+    mkdir -p /models/realesrgan
+    wget -q https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.1/RealESRGAN_x2plus.pth \
+         -O /models/realesrgan/RealESRGAN_x2plus.pth || echo "Real-ESRGAN download skipped (non-critical)"
+fi
+
 # Start ComfyUI in the background
 echo "Starting ComfyUI in the background..."
 python /ComfyUI/main.py --listen --use-sage-attention &

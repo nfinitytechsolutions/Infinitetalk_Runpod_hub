@@ -8,8 +8,9 @@ RUN pip install -U "huggingface_hub[hf_transfer]"
 RUN pip install runpod websocket-client librosa
 
 # Face-fix pipeline dependencies (Crop-Restore-Stitch for melting teeth fix)
-# Note: basicsr is NOT needed — CodeFormer arch is vendored in codeformer_arch.py
-RUN pip install insightface onnxruntime-gpu opencv-python-headless
+# Note: basicsr is NOT needed for CodeFormer — arch is vendored in codeformer_arch.py
+# realesrgan (Real-ESRGAN) is used for whole-frame upscaling after face-fix stitch
+RUN pip install insightface onnxruntime-gpu opencv-python-headless realesrgan
 
 WORKDIR /
 
@@ -68,6 +69,10 @@ RUN wget -q https://huggingface.co/Kijai/MelBandRoFormer_comfy/resolve/main/MelB
 # CodeFormer face restoration model (~370MB)
 RUN mkdir -p /models/codeformer && \
     wget -q https://github.com/sczhou/CodeFormer/releases/download/v0.1.0/codeformer.pth -O /models/codeformer/codeformer.pth
+
+# Real-ESRGAN x2plus upscaler model (~67MB)
+RUN mkdir -p /models/realesrgan && \
+    wget -q https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.1/RealESRGAN_x2plus.pth -O /models/realesrgan/RealESRGAN_x2plus.pth
 
 COPY . .
 RUN chmod +x /entrypoint.sh

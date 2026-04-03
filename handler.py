@@ -570,6 +570,10 @@ def handler(job):
                 codeformer_model_path=face_fix_params.get(
                     "codeformer_model_path", "/models/codeformer/codeformer.pth"
                 ),
+                upscale_enabled=face_fix_params.get("upscale_enabled", False),
+                upscale_model=face_fix_params.get("upscale_model", "RealESRGAN_x2plus"),
+                upscale_target_height=face_fix_params.get("upscale_target_height", 1080),
+                upscale_tile_size=face_fix_params.get("upscale_tile_size", 512),
             )
             output_video_path = fixed_path
             logger.info("✅ Face-fix postprocessing 완료")

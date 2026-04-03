@@ -427,6 +427,108 @@ def stitch_face(frame, restored_crop, params, feather_radius=15):
 
 
 # ---------------------------------------------------------------------------
+# Whole-frame upscaling (Real-ESRGAN)
+# ---------------------------------------------------------------------------
+
+class FrameUpscaler:
+    """Real-ESRGAN whole-frame upscaler.
+
+    Upscales entire stitched frames (not just face crops) to hide
+    crop-stitch seams and add uniform film-grain consistency.
+    """
+
+    MODELS = {
+        "RealESRGAN_x2plus": {
+            "url": "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.1/RealESRGAN_x2plus.pth",
+            "scale": 2,
+            "num_block": 23,
+            "arch": "rrdb",
+        },
+        "RealESRGAN_x4plus": {
+            "url": "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.0/RealESRGAN_x4plus.pth",
+            "scale": 4,
+            "num_block": 23,
+            "arch": "rrdb",
+        },
+        "realesr-general-x4v3": {
+            "url": "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.5.0/realesr-general-x4v3.pth",
+            "scale": 4,
+            "num_block": None,
+            "arch": "srvgg",
+        },
+    }
+
+    def __init__(
+        self,
+        model_name: str = "RealESRGAN_x2plus",
+        model_dir: str = "/models/realesrgan",
+        target_height: int = 1080,
+        tile_size: int = 512,
+        half: bool = True,
+    ):
+        model_info = self.MODELS.get(model_name)
+        if not model_info:
+            raise ValueError(f"Unknown model: {model_name}. Choose from: {list(self.MODELS.keys())}")
+
+        self.target_height = target_height
+        self.native_scale = model_info["scale"]
+
+        model_path = os.path.join(model_dir, f"{model_name}.pth")
+
+        # Download model if not present
+        if not os.path.exists(model_path):
+            logger.info(f"[FacePipeline] Downloading {model_name} model...")
+            os.makedirs(model_dir, exist_ok=True)
+            import urllib.request
+            urllib.request.urlretrieve(model_info["url"], model_path)
+            logger.info(f"[FacePipeline] Downloaded to {model_path}")
+
+        # Build network architecture
+        if model_info["arch"] == "srvgg":
+            from realesrgan.archs.srvgg_arch import SRVGGNetCompact
+            model = SRVGGNetCompact(num_in_ch=3, num_out_ch=3, num_feat=64, num_conv=32, upscale=4, act_type="prelu")
+        else:
+            from basicsr.archs.rrdbnet_arch import RRDBNet
+            model = RRDBNet(num_in_ch=3, num_out_ch=3, num_feat=64, num_block=23, num_grow_ch=32, scale=model_info["scale"])
+
+        from realesrgan import RealESRGANer
+        self.upscaler = RealESRGANer(
+            scale=model_info["scale"],
+            model_path=model_path,
+            model=model,
+            tile=tile_size,
+            tile_pad=10,
+            pre_pad=0,
+            half=half and torch.cuda.is_available(),
+            device=torch.device("cuda" if torch.cuda.is_available() else "cpu"),
+        )
+
+        logger.info(f"[FacePipeline] Real-ESRGAN loaded: {model_name} (scale={self.native_scale}, target_h={target_height}, tile={tile_size})")
+
+    def upscale_frame(self, frame: np.ndarray) -> np.ndarray:
+        """Upscale a single BGR frame."""
+        output, _ = self.upscaler.enhance(frame, outscale=self.native_scale)
+
+        # Resize to exact target if needed
+        h, w = output.shape[:2]
+        if h != self.target_height:
+            target_w = int(w * self.target_height / h)
+            output = cv2.resize(output, (target_w, self.target_height), interpolation=cv2.INTER_LANCZOS4)
+
+        return output
+
+    def upscale_frames(self, frames: list[np.ndarray]) -> list[np.ndarray]:
+        """Upscale all frames with progress logging."""
+        results = []
+        total = len(frames)
+        for i, frame in enumerate(frames):
+            results.append(self.upscale_frame(frame))
+            if (i + 1) % 50 == 0 or (i + 1) == total:
+                logger.info(f"[FacePipeline]   Upscaled {i + 1}/{total} frames")
+        return results
+
+
+# ---------------------------------------------------------------------------
 # Main pipeline
 # ---------------------------------------------------------------------------
 
@@ -441,8 +543,19 @@ def run_face_pipeline(
     detect_interval: int = 5,
     restore_batch_size: int = 8,
     codeformer_model_path: str = "/models/codeformer/codeformer.pth",
+    upscale_enabled: bool = False,
+    upscale_model: str = "RealESRGAN_x2plus",
+    upscale_target_height: int = 1080,
+    upscale_tile_size: int = 512,
 ) -> str:
-    """Run the full Crop-Restore-Stitch face-fix pipeline on a video.
+    """Run the full Crop-Restore-Stitch-Upscale face-fix pipeline on a video.
+
+    Stages:
+      0. Extract frames
+      1. Face detection & tracking (InsightFace)
+      2-3. Crop, restore (CodeFormer), temporal smooth, stitch back
+      4. Whole-frame upscaling with Real-ESRGAN (optional)
+      5. Re-encode output video
 
     Returns path to the output video.
     """
@@ -509,8 +622,23 @@ def run_face_pipeline(
     del restorer
     torch.cuda.empty_cache()
 
-    # Stage 4: Write fixed frames and re-encode
-    logger.info("[FacePipeline] Stage 4: Encoding output video...")
+    # Stage 4: Whole-frame upscaling (Real-ESRGAN)
+    if upscale_enabled:
+        logger.info(f"[FacePipeline] Stage 4: Upscaling frames with {upscale_model} -> {upscale_target_height}p...")
+        upscaler = FrameUpscaler(
+            model_name=upscale_model,
+            target_height=upscale_target_height,
+            tile_size=upscale_tile_size,
+        )
+        frames = upscaler.upscale_frames(frames)
+        del upscaler
+        torch.cuda.empty_cache()
+        logger.info("[FacePipeline] Upscaling complete")
+    else:
+        logger.info("[FacePipeline] Upscaling skipped (not enabled)")
+
+    # Stage 5: Write fixed frames and re-encode
+    logger.info("[FacePipeline] Stage 5: Encoding output video...")
     fixed_frames_dir = os.path.join(work_dir, "fixed_frames")
     os.makedirs(fixed_frames_dir, exist_ok=True)
 
