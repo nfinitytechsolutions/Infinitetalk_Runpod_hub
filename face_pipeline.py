@@ -714,24 +714,21 @@ def auto_crop_input(image_path: str, target_coverage: float = 0.35,
         logger.info("[AutoCrop] Face already fills frame -- two-pass not needed")
         return None
 
-    # Build a 1:1 square crop centred on the face
+    # Build a 1:1 square crop centred on the face, sized to hit target_coverage.
+    # target_coverage = face_area / crop_area  =>  side = sqrt(face_area / target_coverage)
     face_cx, face_cy = (x1 + x2) // 2, (y1 + y2) // 2
+    face_area = face_w * face_h
+    ideal_side = int(np.sqrt(face_area / target_coverage))
+
+    # Add margin for neck/hair context
     face_size = max(face_w, face_h)
-    half_side = int(face_size * (1 + margin) / 2)
+    margin_side = int(face_size * (1 + 2 * margin))
+    side = max(ideal_side, margin_side)
 
-    # Ensure minimum crop size
-    half_side = max(half_side, min_size // 2)
+    # Clamp to image bounds (can't crop larger than the image)
+    side = min(side, w, h)
 
-    crop_x1 = max(0, face_cx - half_side)
-    crop_y1 = max(0, face_cy - half_side)
-    crop_x2 = min(w, face_cx + half_side)
-    crop_y2 = min(h, face_cy + half_side)
-
-    # Make it square by clamping to the smaller side
-    crop_w = crop_x2 - crop_x1
-    crop_h = crop_y2 - crop_y1
-    side = min(crop_w, crop_h)
-    # Re-centre
+    # Centre on face, shift if we hit edges
     crop_x1 = max(0, face_cx - side // 2)
     crop_y1 = max(0, face_cy - side // 2)
     crop_x2 = crop_x1 + side
@@ -743,7 +740,7 @@ def auto_crop_input(image_path: str, target_coverage: float = 0.35,
 
     cropped = img[crop_y1:crop_y2, crop_x1:crop_x2]
 
-    new_coverage = (face_w * face_h) / (side * side)
+    new_coverage = face_area / (side * side)
     logger.info(
         f"[AutoCrop] Cropping ({w}x{h}) -> ({side}x{side})  "
         f"new face coverage={new_coverage:.1%}"
@@ -825,27 +822,33 @@ def composite_two_pass(
             # Get the face crop region from Pass 1
             _, params = detector.crop_face(frames1[i], face, margin=face_margin, size=512)
 
-            # The Pass 2 frame IS the face -- resize it to fit the crop region
-            crop_w = params["crop_x2"] - params["crop_x1"]
-            crop_h = params["crop_y2"] - params["crop_y1"]
-            resized_face = cv2.resize(frames2[i], (crop_w, crop_h), interpolation=cv2.INTER_LANCZOS4)
-
             composite_indices.append(i)
-            composite_crops.append(resized_face)
+            composite_crops.append(frames2[i])  # store raw Pass 2 frame
             composite_params.append(params)
 
         if not composite_crops:
             continue
 
-        # Temporal smoothing on the face crops before stitching
+        # Temporal smoothing: normalize all Pass 2 frames to uniform size first
+        # (face bbox varies slightly across frames, causing shape mismatches)
         if temporal_window > 1 and len(composite_crops) > 1:
+            smooth_size = (composite_crops[0].shape[1], composite_crops[0].shape[0])
+            uniform_crops = [
+                cv2.resize(c, smooth_size, interpolation=cv2.INTER_LANCZOS4)
+                if (c.shape[1], c.shape[0]) != smooth_size else c
+                for c in composite_crops
+            ]
             logger.info(f"[TwoPass]   Temporal smoothing (window={temporal_window})...")
-            composite_crops = temporal_smooth(composite_crops, temporal_window)
+            composite_crops = temporal_smooth(uniform_crops, temporal_window)
 
         # Feathered stitch Pass 2 face onto Pass 1 frames
+        # Resize each smoothed crop to match that frame's face region size
         logger.info(f"[TwoPass]   Stitching {len(composite_crops)} frames (feather={feather_radius}px)...")
         for idx, (frame_i, params) in enumerate(zip(composite_indices, composite_params)):
-            frames1[frame_i] = stitch_face(frames1[frame_i], composite_crops[idx], params, feather_radius)
+            crop_w = params["crop_x2"] - params["crop_x1"]
+            crop_h = params["crop_y2"] - params["crop_y1"]
+            resized_face = cv2.resize(composite_crops[idx], (crop_w, crop_h), interpolation=cv2.INTER_LANCZOS4)
+            frames1[frame_i] = stitch_face(frames1[frame_i], resized_face, params, feather_radius)
 
     # Encode final video
     logger.info("[TwoPass] Encoding composited output...")
