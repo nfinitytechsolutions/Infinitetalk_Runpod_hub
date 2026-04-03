@@ -84,7 +84,7 @@
   },
   "8": {
     "inputs": {
-      "audio_encoder": "wav2vec2_large_english_fp16.safetensors"
+      "audio_encoder_name": "wav2vec2_large_english_fp16.safetensors"
     },
     "class_type": "AudioEncoderLoader",
     "_meta": {
