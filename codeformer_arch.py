@@ -171,6 +171,20 @@ class Decoder(nn.Module):
         return x
 
 
+class VQGANGenerator(nn.Module):
+    """Combined encoder-decoder matching the official CodeFormer checkpoint structure.
+
+    The official checkpoint stores the VQGAN as `generator.encoder.*` and
+    `generator.decoder.*`, so we must wrap both in a single module named
+    `generator` for state_dict keys to align.
+    """
+
+    def __init__(self, in_channels, nf, emb_dim, ch_mult, num_res_blocks, resolution, attn_resolutions):
+        super().__init__()
+        self.encoder = Encoder(in_channels, nf, emb_dim, ch_mult, num_res_blocks, resolution, attn_resolutions)
+        self.decoder = Decoder(in_channels, nf, emb_dim, ch_mult, num_res_blocks, resolution, attn_resolutions)
+
+
 # ---------------------------------------------------------------------------
 # CodeFormer Transformer
 # ---------------------------------------------------------------------------
@@ -280,13 +294,9 @@ class CodeFormer(nn.Module):
                 nn.Conv2d(in_ch * 2, in_ch, 3, 1, 1), nn.LeakyReLU(0.2, True), nn.Conv2d(in_ch, in_ch, 3, 1, 1)
             )
 
-        # VQGAN
-        self.encoder = Encoder(
+        # VQGAN (wrapped in `generator` to match official checkpoint key structure)
+        self.generator = VQGANGenerator(
             in_channels=in_channels, nf=nf, emb_dim=emb_dim, ch_mult=ch_mult,
-            num_res_blocks=num_res_blocks, resolution=resolution, attn_resolutions=attn_resolutions,
-        )
-        self.decoder = Decoder(
-            out_channels=in_channels, nf=nf, emb_dim=emb_dim, ch_mult=ch_mult,
             num_res_blocks=num_res_blocks, resolution=resolution, attn_resolutions=attn_resolutions,
         )
         self.quantize = VectorQuantizer(codebook_size, emb_dim, beta=0.25)
@@ -320,7 +330,7 @@ class CodeFormer(nn.Module):
         # Encoder forward — collect intermediate features
         enc_feat_dict = {}
         out = x
-        for i, block in enumerate(self.encoder.blocks):
+        for i, block in enumerate(self.generator.encoder.blocks):
             out = block(out)
             if isinstance(block, ResnetBlock):
                 # Check spatial resolution
@@ -365,7 +375,7 @@ class CodeFormer(nn.Module):
         out = quant_feat
         fuse_list = [str(2**i) for i in range(int(math.log2(512)), 3, -1)]  # ['256','128','64','32','16']
 
-        for i, block in enumerate(self.decoder.blocks):
+        for i, block in enumerate(self.generator.decoder.blocks):
             out = block(out)
             if isinstance(block, ResnetBlock):
                 h = out.shape[2]
