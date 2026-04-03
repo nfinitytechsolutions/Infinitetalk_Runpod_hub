@@ -276,11 +276,13 @@ class FaceRestorer:
 
         checkpoint = torch.load(model_path, map_location=self.device, weights_only=False)
         if "params_ema" in checkpoint:
-            self.model.load_state_dict(checkpoint["params_ema"])
+            state_dict = checkpoint["params_ema"]
         elif "params" in checkpoint:
-            self.model.load_state_dict(checkpoint["params"])
+            state_dict = checkpoint["params"]
         else:
-            self.model.load_state_dict(checkpoint)
+            state_dict = checkpoint
+
+        self.model.load_state_dict(state_dict)
         self.model.eval()
 
     def restore_batch(self, face_crops, batch_size=8):
